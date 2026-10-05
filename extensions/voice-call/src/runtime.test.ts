@@ -397,6 +397,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     });
 
     const runtime = await createVoiceCallRuntime({
+      scheduler: createTestPluginServiceScheduler(),
       config: createBaseConfig(),
       coreConfig: {} as OpenClawConfig,
       agentRuntime: {} as never,
@@ -428,6 +429,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     mocks.managerStop.mockImplementation(failStep("manager", new Error("manager drain failed")));
 
     const runtime = await createVoiceCallRuntime({
+      scheduler: createTestPluginServiceScheduler(),
       config: createBaseConfig(),
       coreConfig: {} as OpenClawConfig,
       agentRuntime: {} as never,
