@@ -10,7 +10,11 @@ import {
   readConfigHealthStateFromStore,
   patchConfigHealthEntryToStore,
 } from "../config/io.health-state.js";
-import { requireNodeSqlite, resolveImmutableSqliteFileUri } from "../infra/node-sqlite.js";
+import {
+  openNodeSqliteDatabase,
+  requireNodeSqlite,
+  resolveImmutableSqliteFileUri,
+} from "../infra/node-sqlite.js";
 import {
   OpenClawStateOwnershipError,
   OpenClawStateOwnershipMetadataError,
@@ -633,6 +637,8 @@ describe("external shared-state ownership", () => {
     const env = createEnv();
     const databasePath = openOpenClawStateDatabase({ env }).path;
     closeOpenClawStateDatabaseForTest();
+    fs.renameSync(databasePath, `${databasePath}.seed`);
+    fs.copyFileSync(`${databasePath}.seed`, databasePath);
     const { DatabaseSync } = requireNodeSqlite();
     const drifted = new DatabaseSync(databasePath);
     try {
@@ -711,7 +717,7 @@ describe("external shared-state ownership", () => {
     const { DatabaseSync } = requireNodeSqlite();
     const damaged = new DatabaseSync(databasePath);
     damaged.exec(
-      "CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time ON skill_workshop_collection_reviews(review_id, create_time DESC);",
+      "CREATE TABLE IF NOT EXISTS skill_workshop_collection_reviews (review_id TEXT NOT NULL PRIMARY KEY, owner_agent_id TEXT NOT NULL, backup_id TEXT NOT NULL, create_time INTEGER NOT NULL, kept_names_json TEXT NOT NULL, written_names_json TEXT NOT NULL, dropped_json TEXT NOT NULL) STRICT; CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time ON skill_workshop_collection_reviews(review_id, create_time DESC);",
     );
     damaged.enableDefensive?.(false);
     damaged.exec("PRAGMA writable_schema = ON;");
@@ -796,6 +802,8 @@ describe("external shared-state ownership", () => {
     const { path: databasePath, db: seeded } = openOpenClawStateDatabase({ env });
     const databaseLocation = seeded.location();
     closeOpenClawStateDatabaseForTest();
+    fs.renameSync(databasePath, `${databasePath}.seed`);
+    fs.copyFileSync(`${databasePath}.seed`, databasePath);
     const { DatabaseSync } = requireNodeSqlite();
     const originalExec = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec")?.value as
       | ((this: import("node:sqlite").DatabaseSync, sql: string) => void)
@@ -846,7 +854,7 @@ describe("external shared-state ownership", () => {
     expect(claimInjected).toBe(true);
   });
 
-  it("fences cached and injected handles after another connection commits an owner", () => {
+  it("fences cached and injected handles after an in-process writer commits an owner", () => {
     const externalEnv = createEnv(true);
     const unmarkedEnv = withoutExternalMarker(externalEnv);
     const opened = openOpenClawStateDatabase({ env: unmarkedEnv });
@@ -859,11 +867,7 @@ describe("external shared-state ownership", () => {
       expect(reads.queries).toEqual([indexedOwnershipSql]);
       reads.queries.length = 0;
       runOpenClawStateWriteTransaction(() => undefined, { env: unmarkedEnv, database: opened });
-      expect(reads.queries).toEqual([
-        indexedOwnershipSql,
-        "PRAGMA data_version",
-        indexedOwnershipSql,
-      ]);
+      expect(reads.queries).toEqual([indexedOwnershipSql]);
     } finally {
       reads.restore();
     }
@@ -881,15 +885,30 @@ describe("external shared-state ownership", () => {
       managerId: "late-supervisor",
       claimedAt: 1,
     };
-    const { DatabaseSync } = requireNodeSqlite();
-    const claimant = new DatabaseSync(opened.path);
+    const claimant = openNodeSqliteDatabase(opened.path);
+    const originalExec = opened.db.exec.bind(opened.db);
+    let claimedBeforeBegin = false;
+    const begin = vi.spyOn(opened.db, "exec").mockImplementation((sql) => {
+      if (sql === "BEGIN IMMEDIATE" && !claimedBeforeBegin) {
+        claimant
+          .prepare(
+            "INSERT INTO config_machine_state (state_key, value_json, updated_at_ms) VALUES (?, ?, ?)",
+          )
+          .run(STATE_SUPERVISION_KEY, JSON.stringify(ownership), ownership.claimedAt);
+        claimedBeforeBegin = true;
+      }
+      originalExec(sql);
+    });
+    const write = vi.fn();
     try {
-      claimant
-        .prepare(
-          "INSERT INTO config_machine_state (state_key, value_json, updated_at_ms) VALUES (?, ?, ?)",
-        )
-        .run(STATE_SUPERVISION_KEY, JSON.stringify(ownership), ownership.claimedAt);
+      expect(() =>
+        runOpenClawStateWriteTransaction(write, { env: unmarkedEnv, database: opened }),
+      ).toThrow(OpenClawStateOwnershipError);
+      expect(claimedBeforeBegin).toBe(true);
+      expect(write).not.toHaveBeenCalled();
+      expect(opened.db.isTransaction).toBe(false);
     } finally {
+      begin.mockRestore();
       claimant.close();
     }
 
@@ -899,7 +918,6 @@ describe("external shared-state ownership", () => {
     expect(() => openOpenClawStateDatabase({ env: unmarkedEnv, database: opened })).toThrow(
       OpenClawStateOwnershipError,
     );
-    const write = vi.fn();
     expect(() => runOpenClawStateWriteTransaction(write, { env: unmarkedEnv })).toThrow(
       OpenClawStateOwnershipError,
     );
