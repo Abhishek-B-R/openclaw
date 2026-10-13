@@ -391,8 +391,8 @@ describe("sendHostedFileUrl", () => {
 
   it("paces each incoming webhook endpoint independently", async () => {
     mockSuccessResponse();
-    const accountA = "https://nas-a.example.com/incoming";
-    const accountB = "https://nas-b.example.com/incoming";
+    const accountA = "https://nas.example.com/incoming?token=account-a";
+    const accountB = "https://nas.example.com/incoming?token=account-b";
     const requestedUrls = () =>
       vi.mocked(https.request).mock.calls.map(([url]) => (url instanceof URL ? url.href : url));
 
